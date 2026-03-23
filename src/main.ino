@@ -730,61 +730,209 @@ void classifyBrowsingAndQueue(uint32_t nowMs) {
   }
 }
 
+const char* carryLabel() {
+  if (M.carryStyle == "LIFTED") return "Lifted";
+  if (M.carryStyle == "PARKED") return "Paused";
+  if (M.carryStyle == "TILTED_PUSH") return "Moving";
+  if (M.carryStyle == "ROUGH_ROLL") return "Rolling";
+  if (M.carryStyle == "SMOOTH_ROLL") return "Gliding";
+  return "Active";
+}
+
+const char* loadLabel() {
+  if (M.loadProxy == "HEAVY_PROXY") return "Heavy";
+  if (M.loadProxy == "MEDIUM_PROXY") return "Medium";
+  if (M.loadProxy == "LIGHT_PROXY") return "Light";
+  return "Unknown";
+}
+
+const char* zoneLabel() {
+  if (M.zone == "ZONE_A") return "A";
+  if (M.zone == "ZONE_B") return "B";
+  if (M.zone == "ZONE_C") return "C";
+  if (M.zone == "BETWEEN_A_B") return "A-B";
+  if (M.zone == "BETWEEN_B_C") return "B-C";
+  if (M.zone == "BETWEEN_A_C") return "A-C";
+  return "--";
+}
+
+const char* modeLabel() {
+  if (M.queueDetect) return "Queue";
+  if (M.browsing) return "Browse";
+  if (M.carryStyle == "PARKED") return "Pause";
+  return "Shop";
+}
+
+const char* heroMessage() {
+  if (M.queueDetect) return "Queue ahead";
+  if (M.browsing) return "Keep browsing";
+  if (M.pickup) return "Basket lifted";
+  if (M.dropdown) return "Set down gently";
+  if (M.stepCadence_spm > 20.0f || M.speed_mps > 0.05f) return "On the move";
+  if (M.carryStyle == "LIFTED") return "Hold steady";
+  if (M.carryStyle == "PARKED") return "Ready to shop";
+  return "Cartly ready";
+}
+
+uint16_t heroColor() {
+  if (M.queueDetect) return C_RED;
+  if (M.browsing) return C_ORANGE;
+  if (M.carryStyle == "LIFTED") return C_YELLOW;
+  if (M.stepCadence_spm > 0.0f) return C_GREEN;
+  return C_CYAN;
+}
+
+void drawStatCard(int16_t x, int16_t y, int16_t w, int16_t h, const char *label, const String &value, uint16_t accent) {
+  gfx->fillRoundRect(x, y, w, h, 10, 0x1082);
+  gfx->drawRoundRect(x, y, w, h, 10, 0x2945);
+  gfx->fillRoundRect(x + 6, y + 8, 4, h - 16, 2, accent);
+  gfx->setTextColor(C_GREY);
+  gfx->setTextSize(1);
+  gfx->setCursor(x + 16, y + 7);
+  gfx->print(label);
+  gfx->setTextColor(C_WHITE);
+  uint8_t valueSize = (w <= 70 || value.length() >= 5) ? 1 : 2;
+  gfx->setTextSize(valueSize);
+  gfx->setCursor(x + 16, valueSize == 2 ? (y + 21) : (y + 24));
+  gfx->print(value);
+}
+
 // ===================== UI / Output =====================
 void updateDisplay() {
-  gfx->fillRect(0, 35, 240, 205, C_BLACK);
+  static bool layoutDrawn = false;
+  static String lastHero = "";
+  static String stableHero = "";
+  static uint32_t stableHeroSinceMs = 0;
+  static bool lastLive = false;
+  static int lastCadence = -1;
+  static int lastCadenceBar = -1;
+  static String lastSpeed = "";
+  static String lastCarry = "";
+  static String lastLoad = "";
+  static String lastPause = "";
+  static String lastZone = "";
+  static String lastMode = "";
 
-  gfx->setTextSize(1);
-  gfx->setTextColor(C_CYAN);
-  gfx->setCursor(6, 40);
-  gfx->printf("Cad:%4.0f Spd:%4.2f", M.stepCadence_spm, M.speed_mps);
+  uint16_t accent = heroColor();
+  int cadenceBar = (int)clampf((M.stepCadence_spm / 130.0f) * 204.0f, 0.0f, 204.0f);
+  String heroCandidate = heroMessage();
+  bool live = mqttClient.connected();
+  int cadence = (int)(M.stepCadence_spm + 0.5f);
+  String speedText = String(M.speed_mps, 2);
+  String dwellText = String((unsigned long)(M.dwell_ms / 1000UL)) + "s";
+  String carryText = carryLabel();
+  String loadText = loadLabel();
+  String zoneText = zoneLabel();
+  String modeText = modeLabel();
 
-  gfx->setTextColor(C_YELLOW);
-  gfx->setCursor(6, 54);
-  gfx->printf("A:%ld B:%ld C:%ld",
-              (long)M.anchorA_rssi,
-              (long)M.anchorB_rssi,
-              (long)M.anchorC_rssi);
+  if (stableHero.length() == 0) {
+    stableHero = heroCandidate;
+    stableHeroSinceMs = millis();
+  } else if (heroCandidate != stableHero) {
+    bool urgentHero = (heroCandidate == "Queue ahead" || heroCandidate == "Basket lifted" || heroCandidate == "Set down gently");
+    if (urgentHero || (millis() - stableHeroSinceMs) > 1200) {
+      stableHero = heroCandidate;
+      stableHeroSinceMs = millis();
+    }
+  }
 
-  gfx->setCursor(6, 68);
-  gfx->print("Zone:");
-  gfx->print(M.zone);
+  if (!layoutDrawn) {
+    gfx->fillScreen(C_BLACK);
+    gfx->fillRoundRect(8, 8, 224, 54, 16, 0x0410);
+    gfx->fillRoundRect(12, 12, 216, 46, 14, C_BLACK);
+    gfx->drawRoundRect(12, 12, 216, 46, 14, 0x2104);
 
-  gfx->setTextColor(C_GREEN);
-  gfx->setCursor(6, 82);
-  gfx->print("Carry:");
-  gfx->print(M.carryStyle);
+    gfx->setTextColor(C_GREY);
+    gfx->setTextSize(1);
+    gfx->setCursor(26, 16);
+    gfx->print("CARTLY");
 
-  gfx->setCursor(6, 96);
-  gfx->print("Load:");
-  gfx->print(M.loadProxy);
+    gfx->setTextColor(C_GREY);
+    gfx->setTextSize(1);
+    gfx->setCursor(14, 72);
+    gfx->print("PACE");
+    gfx->setCursor(144, 72);
+    gfx->print("MOVE");
 
-  long encCopy;
-  noInterrupts();
-  encCopy = encoderCount;
-  interrupts();
+    gfx->drawRoundRect(14, 112, 212, 16, 8, 0x2945);
 
-  gfx->setTextColor(C_WHITE);
-  gfx->setCursor(6, 112);
-  gfx->printf("ENC:%ld", encCopy);
+    layoutDrawn = true;
+  }
 
-  gfx->setCursor(6, 126);
-  gfx->print("AWS:");
-  gfx->print(mqttClient.connected() ? "OK" : "OFF");
+  gfx->fillRect(12, 12, 8, 46, accent);
 
-  gfx->setCursor(6, 140);
-  gfx->printf("AX:%4.2f AY:%4.2f AZ:%4.2f", M.ax, M.ay, M.az);
+  if (stableHero != lastHero) {
+    gfx->fillRect(24, 28, 142, 22, C_BLACK);
+    gfx->setTextColor(accent);
+    gfx->setTextSize(2);
+    gfx->setCursor(26, 30);
+    gfx->print(stableHero);
+    lastHero = stableHero;
+  }
 
-  gfx->setCursor(6, 154);
-  gfx->printf("aD:%4.2f aDF:%4.2f", M.aDyn, adynFilt_dbg);
+  if (live != lastLive) {
+    gfx->fillRoundRect(170, 16, 52, 18, 9, live ? C_GREEN : C_RED);
+    gfx->setTextColor(C_BLACK);
+    gfx->setTextSize(1);
+    gfx->setCursor(live ? 180 : 184, 22);
+    gfx->print(live ? "LIVE" : "OFF");
+    lastLive = live;
+  }
 
-  gfx->setCursor(6, 168);
-  gfx->print("Queue:");
-  gfx->print(M.queueDetect ? "YES" : "NO");
+  if (cadence != lastCadence) {
+    gfx->fillRect(14, 84, 74, 24, C_BLACK);
+    gfx->setTextColor(C_WHITE);
+    gfx->setTextSize(3);
+    gfx->setCursor(14, 84);
+    gfx->print(cadence);
+    gfx->setTextSize(1);
+    gfx->setCursor(92, 97);
+    gfx->setTextColor(C_GREY);
+    gfx->print("spm");
+    lastCadence = cadence;
+  }
 
-  gfx->setCursor(6, 182);
-  gfx->print("State:");
-  gfx->print(M.systemState);
+  if (speedText != lastSpeed) {
+    gfx->fillRect(144, 84, 70, 22, C_BLACK);
+    gfx->setTextColor(C_CYAN);
+    gfx->setTextSize(2);
+    gfx->setCursor(144, 84);
+    gfx->print(speedText);
+    gfx->setTextSize(1);
+    gfx->setTextColor(C_GREY);
+    gfx->setCursor(144, 104);
+    gfx->print("m/s");
+    lastSpeed = speedText;
+  }
+
+  if (cadenceBar != lastCadenceBar) {
+    gfx->fillRoundRect(18, 116, 204, 8, 4, 0x18C3);
+    if (cadenceBar > 0) {
+      gfx->fillRoundRect(18, 116, cadenceBar, 8, 4, accent);
+    }
+    lastCadenceBar = cadenceBar;
+  }
+
+  if (carryText != lastCarry) {
+    drawStatCard(12, 138, 104, 42, "Carry", carryText, C_GREEN);
+    lastCarry = carryText;
+  }
+  if (loadText != lastLoad) {
+    drawStatCard(124, 138, 104, 42, "Load", loadText, C_YELLOW);
+    lastLoad = loadText;
+  }
+  if (dwellText != lastPause) {
+    drawStatCard(12, 188, 68, 42, "Pause", dwellText, C_ORANGE);
+    lastPause = dwellText;
+  }
+  if (zoneText != lastZone) {
+    drawStatCard(86, 188, 68, 42, "Zone", zoneText, C_CYAN);
+    lastZone = zoneText;
+  }
+  if (modeText != lastMode) {
+    drawStatCard(160, 188, 68, 42, "Mode", modeText, accent);
+    lastMode = modeText;
+  }
 }
 
 void printSerialSummary(float signedSpeed_mps) {
