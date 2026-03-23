@@ -8,6 +8,7 @@ dist/
 build/
 out/
 .pio/
+.vite/
 .next/
 .nuxt/
 
@@ -25,6 +26,14 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+
+# Python
+__pycache__/
+*.pyc
+
+# Dashboard runtime files
+dashboard/frontend/node_modules/
+dashboard/backend/trolley.db
 
 # Logs
 *.log
