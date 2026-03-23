@@ -3,6 +3,7 @@
 #include <QMI8658.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <WiFiUDP.h>
 #include <PubSubClient.h>
 #include <math.h>
 
@@ -11,7 +12,7 @@ const char* WIFI_SSID = "YungHub";
 const char* WIFI_PASS = "yungyung";
 
 // ===================== MQTT Broker =====================
-const char* MQTT_HOST        = "cartly.flemingsociety.com";
+const char* MQTT_HOST        = "mqtt.yungcz.com";
 const int   MQTT_PORT        = 8883;
 const char* MQTT_USERNAME    = "cartly";
 const char* MQTT_PASSWORD    = "cartly";
@@ -58,8 +59,16 @@ emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=
 WiFiClientSecure net;
 PubSubClient mqttClient(net);
 
-static const uint32_t CLOUD_UPLOAD_MS = 250;
+static const uint32_t CLOUD_UPLOAD_MS  = 250;
 uint32_t lastCloudUploadMs = 0;
+
+// ===================== Direct Streaming (UDP) =====================
+char     directHost[64]        = "";    // set via MQTT config: {"directHost":"x.x.x.x"}
+uint16_t directPort            = 4210;
+bool     directEnabled         = false; // set via MQTT config: {"directEnabled":true}
+WiFiUDP  directUdp;
+static const uint32_t DIRECT_UPLOAD_MS = 50;
+uint32_t lastDirectUploadMs    = 0;
 
 // ===================== Anchor SSIDs =====================
 const char* ANCHOR_A = "ANCHOR_A";
@@ -108,36 +117,42 @@ QMI8658 imu;
 volatile long encoderCount = 0;
 volatile uint8_t prevAB = 0;
 volatile uint32_t encIsrHits = 0;
-
-const int8_t QUAD_TABLE[16] = {
-  0, -1, +1,  0,
-  +1, 0,  0, -1,
-  -1, 0,  0, +1,
-  0, +1, -1,  0
-};
+uint32_t encoderPollHits = 0;
 
 void IRAM_ATTR encoderISR() {
-  uint8_t a = (uint8_t)digitalRead(PIN_ENC_A);
-  uint8_t b = (uint8_t)digitalRead(PIN_ENC_B);
-  uint8_t currAB = (a << 1) | b;
-
-  uint8_t idx = (prevAB << 2) | currAB;
-  int8_t step = QUAD_TABLE[idx];
-
-  if (step != 0) {
-    encoderCount += step;
-  }
-
-  prevAB = currAB;
   encIsrHits++;
 }
 
+void pollEncoderFast() {
+  static int lastA = -1;
+  static uint32_t lastEdgeUs = 0;
+
+  int a = digitalRead(PIN_ENC_A);
+
+  if (lastA < 0) {
+    lastA = a;
+    return;
+  }
+
+  if (a != lastA) {
+    uint32_t nowUs = micros();
+    if (a == HIGH && nowUs - lastEdgeUs >= 100) {
+      encoderCount += 1;
+      encoderPollHits++;
+      lastEdgeUs = nowUs;
+    }
+    lastA = a;
+  }
+}
+
 // ===================== Wheel / Encoder =====================
-static const float MOTOR_ENCODER_CPR = 12.0f;
-static const float GEAR_RATIO        = 50.0f;
+// MMME uses a 6-pole magnetic disc on the wheel shaft.
+// Counting rising edges on channel A gives 3 counts per wheel revolution.
+static const float MOTOR_ENCODER_CPR = 3.0f;
+static const float GEAR_RATIO        = 1.0f;
 static const float COUNTS_PER_REV    = MOTOR_ENCODER_CPR * GEAR_RATIO;
 
-static const float WHEEL_DIAM_M      = 0.035f;
+static const float WHEEL_DIAM_M      = 0.0452f;
 static const float WHEEL_CIRC_M      = WHEEL_DIAM_M * 3.1415926f;
 
 // ===================== Timing =====================
@@ -205,6 +220,7 @@ Metrics M = {};
 float gravX = 0, gravY = 0, gravZ = 0;
 float dynRms = 0;
 float speedSignedSmooth = 0.0f;
+float speedAbsSmooth = 0.0f;
 float vibEMA = 0;
 float jerkEMA = 0;
 float lastSpeedMps = 0;
@@ -237,6 +253,9 @@ uint32_t lastStopGoMarkMs = 0;
 bool actuatorActive = false;
 uint32_t actuatorOffAt = 0;
 bool anchorScanInProgress = false;
+bool displayFlashActive = false;
+uint32_t displayFlashOffAt = 0;
+bool displayNeedsFullRedraw = false;
 
 // ===================== Helpers =====================
 float ema(float prev, float x, float alpha) {
@@ -328,9 +347,22 @@ void actuatorOnFor(uint32_t ms) {
 }
 
 void serviceActuator() {
-  if (actuatorActive && millis() >= actuatorOffAt) {
+  if (actuatorActive && (!actuatorEnabled || millis() >= actuatorOffAt)) {
     digitalWrite(PIN_ACTUATOR, LOW);
     actuatorActive = false;
+  }
+}
+
+void flashDisplayFor(uint32_t ms) {
+  if (ms == 0) return;
+  displayFlashActive = true;
+  displayFlashOffAt = millis() + ms;
+}
+
+void serviceDisplayFlash() {
+  if (displayFlashActive && millis() >= displayFlashOffAt) {
+    displayFlashActive = false;
+    displayNeedsFullRedraw = true;
   }
 }
 
@@ -399,6 +431,19 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 
   v = extractJsonValue(msg, "actuatorPulseMs");
   if (v.length()) actuatorOnFor((uint32_t)v.toInt());
+
+  v = extractJsonValue(msg, "displayFlashMs");
+  if (v.length()) flashDisplayFor((uint32_t)v.toInt());
+
+  v = extractJsonValue(msg, "directHost");
+  if (v.length()) v.toCharArray(directHost, sizeof(directHost));
+
+  v = extractJsonValue(msg, "directPort");
+  if (v.length()) directPort = (uint16_t)v.toInt();
+
+  v = extractJsonValue(msg, "directEnabled");
+  if (v == "true"  || v == "1") directEnabled = true;
+  if (v == "false" || v == "0") directEnabled = false;
 }
 
 // ===================== Connectivity =====================
@@ -813,6 +858,41 @@ void updateDisplay() {
   static String lastZone = "";
   static String lastMode = "";
 
+  if (displayNeedsFullRedraw) {
+    layoutDrawn = false;
+    lastHero = "";
+    stableHero = "";
+    stableHeroSinceMs = 0;
+    lastLive = false;
+    lastCadence = -1;
+    lastCadenceBar = -1;
+    lastSpeed = "";
+    lastCarry = "";
+    lastLoad = "";
+    lastPause = "";
+    lastZone = "";
+    lastMode = "";
+    displayNeedsFullRedraw = false;
+  }
+
+  if (displayFlashActive) {
+    bool invert = ((millis() / 180UL) % 2UL) == 0UL;
+    uint16_t bg = invert ? C_RED : C_WHITE;
+    uint16_t fg = invert ? C_WHITE : C_RED;
+
+    gfx->fillScreen(bg);
+    gfx->setTextColor(fg);
+    gfx->setTextSize(2);
+    gfx->setCursor(54, 72);
+    gfx->print("ATTENTION");
+    gfx->setTextSize(1);
+    gfx->setCursor(44, 112);
+    gfx->print("Please check your trolley");
+    gfx->setCursor(56, 132);
+    gfx->print("Store staff alerted");
+    return;
+  }
+
   uint16_t accent = heroColor();
   int cadenceBar = (int)clampf((M.stepCadence_spm / 130.0f) * 204.0f, 0.0f, 204.0f);
   String heroCandidate = heroMessage();
@@ -955,6 +1035,7 @@ void printSerialSummary(float signedSpeed_mps) {
   Serial.print("\"imu_ok\":"); Serial.print(M.imuOk ? "true" : "false"); Serial.print(",");
   Serial.print("\"aws_ok\":"); Serial.print(M.awsOk ? "true" : "false"); Serial.print(",");
   Serial.print("\"system_state\":\""); Serial.print(M.systemState); Serial.print("\",");
+  Serial.print("\"transport\":\""); Serial.print(directStreamReady() ? "direct" : "mqtt"); Serial.print("\",");
   Serial.print("\"speed_mps\":"); Serial.print(M.speed_mps, 3); Serial.print(",");
   Serial.print("\"signed_speed_mps\":"); Serial.print(signedSpeed_mps, 3); Serial.print(",");
   Serial.print("\"distance_m\":"); Serial.print(M.dist_m, 2); Serial.print(",");
@@ -964,13 +1045,9 @@ void printSerialSummary(float signedSpeed_mps) {
   Serial.println("}");
 }
 
-void publishTelemetry(float signedSpeed_mps) {
-  if (!mqttClient.connected()) return;
-
-  char payload[1200];
-
+static void buildPayload(char* buf, size_t sz, float signedSpeed_mps) {
   snprintf(
-    payload, sizeof(payload),
+    buf, sz,
     "{"
     "\"timestamp_ms\":%lu,"
     "\"device_id\":\"%s\","
@@ -990,6 +1067,7 @@ void publishTelemetry(float signedSpeed_mps) {
     "\"imu_ok\":%s,"
     "\"aws_ok\":%s,"
     "\"system_state\":\"%s\","
+    "\"transport\":\"%s\","
     "\"speed_mps\":%.3f,"
     "\"signed_speed_mps\":%.3f,"
     "\"distance_m\":%.2f,"
@@ -1015,6 +1093,7 @@ void publishTelemetry(float signedSpeed_mps) {
     M.imuOk ? "true" : "false",
     M.awsOk ? "true" : "false",
     M.systemState.c_str(),
+    directStreamReady() ? "direct" : "mqtt",
     M.speed_mps,
     signedSpeed_mps,
     M.dist_m,
@@ -1022,11 +1101,31 @@ void publishTelemetry(float signedSpeed_mps) {
     posY_m,
     M.hotspot.c_str()
   );
+}
 
+bool directStreamReady() {
+  return directEnabled && directHost[0] != '\0' && WiFi.status() == WL_CONNECTED;
+}
+
+void publishTelemetry(float signedSpeed_mps) {
+  if (directStreamReady()) return;
+  if (!mqttClient.connected()) return;
+  char payload[1200];
+  buildPayload(payload, sizeof(payload), signedSpeed_mps);
   bool ok = mqttClient.publish(MQTT_TOPIC_PUB, payload);
   if (!ok) {
     mqttClient.disconnect();
     lastMQTTAttemptMs = 0;
+  }
+}
+
+void streamDirect(float signedSpeed_mps) {
+  if (!directStreamReady()) return;
+  char payload[1200];
+  buildPayload(payload, sizeof(payload), signedSpeed_mps);
+  if (directUdp.beginPacket(directHost, directPort)) {
+    directUdp.write((uint8_t*)payload, strlen(payload));
+    directUdp.endPacket();
   }
 }
 
@@ -1065,14 +1164,11 @@ void setup() {
   imu.setGyroUnit_dps(true);
   imu.setDisplayPrecision(3);
 
-  pinMode(PIN_ENC_A, INPUT_PULLUP);
-  pinMode(PIN_ENC_B, INPUT_PULLUP);
+  pinMode(PIN_ENC_A, INPUT);
+  pinMode(PIN_ENC_B, INPUT);
   delay(10);
 
   prevAB = ((uint8_t)digitalRead(PIN_ENC_A) << 1) | (uint8_t)digitalRead(PIN_ENC_B);
-
-  attachInterrupt(digitalPinToInterrupt(PIN_ENC_A), encoderISR, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(PIN_ENC_B), encoderISR, CHANGE);
 
   memset(occupancy, 0, sizeof(occupancy));
   memset(dwellMap, 0, sizeof(dwellMap));
@@ -1096,7 +1192,9 @@ void loop() {
   connectMQTT(now);
   mqttClient.loop();
   serviceActuator();
+  serviceDisplayFlash();
   serviceAnchorScan();
+  pollEncoderFast();
 
   if (now - lastLoopMs < LOOP_MS) return;
 
@@ -1118,9 +1216,18 @@ void loop() {
 
   static long lastEnc = 0;
   long enc;
-  noInterrupts();
+  uint32_t pollHits;
   enc = encoderCount;
-  interrupts();
+  pollHits = encoderPollHits;
+
+  uint8_t rawA = (uint8_t)digitalRead(PIN_ENC_A);
+  uint8_t rawB = (uint8_t)digitalRead(PIN_ENC_B);
+
+  Serial.print("[ENC] A="); Serial.print(rawA);
+  Serial.print(" B=");       Serial.print(rawB);
+  Serial.print(" count=");   Serial.print(enc);
+  Serial.print(" pollHits="); Serial.print(pollHits);
+  Serial.print(" isrHits="); Serial.println(encIsrHits);
 
   long dEnc = enc - lastEnc;
   lastEnc = enc;
@@ -1129,10 +1236,12 @@ void loop() {
   M.dist_m += fabs(dMeters);
 
   float instSpeedSigned = (dt_s > 0.001f) ? (dMeters / dt_s) : 0.0f;
+  float instSpeedAbs = (dt_s > 0.001f) ? (fabs(dMeters) / dt_s) : 0.0f;
   speedSignedSmooth = ema(speedSignedSmooth, instSpeedSigned, 0.35f);
+  speedAbsSmooth = ema(speedAbsSmooth, instSpeedAbs, 0.35f);
   float signedSpeed_mps = speedSignedSmooth;
 
-  M.speed_mps = fabs(signedSpeed_mps);
+  M.speed_mps = speedAbsSmooth;
 
   M.aMag = sqrtf(M.ax * M.ax + M.ay * M.ay + M.az * M.az);
 
@@ -1166,7 +1275,9 @@ void loop() {
   classifyLoadProxy();
   classifyBrowsingAndQueue(now);
 
-  if (now - lastRssiScanMs >= rssiScanIntervalMs) {
+  // Wi-Fi scans can stall timing-sensitive encoder sampling, so only scan
+  // when the trolley is effectively stationary.
+  if (now - lastRssiScanMs >= rssiScanIntervalMs && M.speed_mps < 0.02f) {
     lastRssiScanMs = now;
     startAnchorScan();
   }
@@ -1186,6 +1297,11 @@ void loop() {
     updateDisplay();
   }
 
+  if (now - lastDirectUploadMs >= DIRECT_UPLOAD_MS) {
+    lastDirectUploadMs = now;
+    streamDirect(signedSpeed_mps);
+  }
+
   if (now - lastCloudUploadMs >= CLOUD_UPLOAD_MS) {
     lastCloudUploadMs = now;
     publishTelemetry(signedSpeed_mps);
@@ -1194,4 +1310,3 @@ void loop() {
   M.pickup = false;
   M.dropdown = false;
 }
-

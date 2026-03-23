@@ -10,7 +10,7 @@ class TelemetryReading(Base):
     received_at = Column(DateTime, server_default=func.now())
 
     # Device
-    device_id = Column(String, index=True)
+    device_id = Column(String(64), index=True)
     timestamp_ms = Column(Integer)
 
     # Motion
@@ -25,8 +25,8 @@ class TelemetryReading(Base):
     dwell_time_ms = Column(Integer)
 
     # Classification
-    carry_style = Column(String)
-    load_proxy = Column(String)
+    carry_style = Column(String(32))
+    load_proxy = Column(String(32))
     browsing = Column(Boolean)
     queue_detect = Column(Boolean)
 
@@ -35,12 +35,12 @@ class TelemetryReading(Base):
     anchor_b_rssi = Column(Integer)
     anchor_c_rssi = Column(Integer)
     anchors_seen = Column(Integer)
-    zone = Column(String)
+    zone = Column(String(64))
     pos_x_m = Column(Float)
     pos_y_m = Column(Float)
-    live_hotspot = Column(String)
+    live_hotspot = Column(String(64))
 
     # System
     imu_ok = Column(Boolean)
     aws_ok = Column(Boolean)
-    system_state = Column(String)
+    system_state = Column(String(32))

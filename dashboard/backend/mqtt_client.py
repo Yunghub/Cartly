@@ -7,7 +7,7 @@ from typing import Callable, Optional
 
 import paho.mqtt.client as mqtt
 
-MQTT_HOST = "cartly.flemingsociety.com"
+MQTT_HOST = "mqtt.yungcz.com"
 MQTT_PORT = 8883
 MQTT_USERNAME = "cartly"
 MQTT_PASSWORD = "cartly"
