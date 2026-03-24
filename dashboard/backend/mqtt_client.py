@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import socket
 import ssl
 import tempfile
 from typing import Callable, Optional
@@ -53,12 +54,31 @@ _client: Optional[mqtt.Client] = None
 _loop: Optional[asyncio.AbstractEventLoop] = None
 _on_telemetry: Optional[Callable] = None
 _ca_path: Optional[str] = None
+_UDP_PORT = 4210
+_ENABLE_DIRECT_STREAM = os.getenv("ENABLE_DIRECT_STREAM", "0") == "1"
+_DIRECT_STREAM_HOST = os.getenv("DIRECT_STREAM_HOST", "").strip()
+
+
+def _get_local_ip() -> str:
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return ""
 
 
 def _on_connect(client, userdata, flags, rc):
     if rc == 0:
         client.subscribe(MQTT_TOPIC_TELEMETRY)
         print(f"[MQTT] Connected — subscribed to {MQTT_TOPIC_TELEMETRY}")
+        ip = _DIRECT_STREAM_HOST or _get_local_ip()
+        if _ENABLE_DIRECT_STREAM and ip:
+            msg = json.dumps({"directHost": ip, "directEnabled": True})
+            client.publish(MQTT_TOPIC_CONFIG, msg, qos=1)
+            print(f"[MQTT] Advertised direct stream → {ip}:{_UDP_PORT}")
     else:
         print(f"[MQTT] Connect failed rc={rc}")
 

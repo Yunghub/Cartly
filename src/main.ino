@@ -59,7 +59,7 @@ emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=
 WiFiClientSecure net;
 PubSubClient mqttClient(net);
 
-static const uint32_t CLOUD_UPLOAD_MS  = 250;
+static const uint32_t CLOUD_UPLOAD_MS  = 100;
 uint32_t lastCloudUploadMs = 0;
 
 // ===================== Direct Streaming (UDP) =====================
@@ -156,12 +156,13 @@ static const float WHEEL_DIAM_M      = 0.0452f;
 static const float WHEEL_CIRC_M      = WHEEL_DIAM_M * 3.1415926f;
 
 // ===================== Timing =====================
-static const uint32_t LOOP_MS              = 50;
+static const uint32_t LOOP_MS              = 20;
 static const uint32_t DISPLAY_PERIOD_MS    = 200;
 static const uint32_t SERIAL_PERIOD_MS     = 250;
 static const uint32_t DEFAULT_RSSI_SCAN_MS = 15000;
 static const uint32_t WIFI_RETRY_MS        = 10000;
-static const uint32_t MQTT_RETRY_MS        = 5000;
+static const uint32_t MQTT_RETRY_MS        = 1500;
+static const uint32_t EVENT_UPLOAD_GAP_MS  = 40;
 
 // ===================== Thresholds (remote configurable) =====================
 float pickupAccelThreshold   = 2.5f;
@@ -256,6 +257,12 @@ bool anchorScanInProgress = false;
 bool displayFlashActive = false;
 uint32_t displayFlashOffAt = 0;
 bool displayNeedsFullRedraw = false;
+uint32_t lastEventUploadMs = 0;
+bool lastPublishedPickup = false;
+bool lastPublishedDropDown = false;
+bool lastPublishedQueueDetect = false;
+bool lastPublishedBrowsing = false;
+bool lastPublishedAwsOk = false;
 
 // ===================== Helpers =====================
 float ema(float prev, float x, float alpha) {
@@ -468,8 +475,8 @@ void connectMQTT(uint32_t nowMs) {
 
   mqttClient.setServer(MQTT_HOST, MQTT_PORT);
   mqttClient.setCallback(mqttCallback);
-  mqttClient.setKeepAlive(15);
-  mqttClient.setSocketTimeout(2);
+  mqttClient.setKeepAlive(10);
+  mqttClient.setSocketTimeout(1);
 
   Serial.print("Connecting to MQTT broker... ");
   if (mqttClient.connect(DEVICE_ID, MQTT_USERNAME, MQTT_PASSWORD)) {
@@ -882,14 +889,14 @@ void updateDisplay() {
 
     gfx->fillScreen(bg);
     gfx->setTextColor(fg);
-    gfx->setTextSize(2);
-    gfx->setCursor(54, 72);
+    gfx->setTextSize(3);
+    gfx->setCursor(39, 55);
     gfx->print("ATTENTION");
-    gfx->setTextSize(1);
-    gfx->setCursor(44, 112);
-    gfx->print("Please check your trolley");
-    gfx->setCursor(56, 132);
-    gfx->print("Store staff alerted");
+    gfx->setTextSize(2);
+    gfx->setCursor(12, 108);
+    gfx->print("Check trolley");
+    gfx->setCursor(18, 138);
+    gfx->print("Staff alerted");
     return;
   }
 
@@ -1119,6 +1126,25 @@ void publishTelemetry(float signedSpeed_mps) {
   }
 }
 
+bool shouldPublishEventNow(uint32_t nowMs) {
+  if (nowMs - lastEventUploadMs < EVENT_UPLOAD_GAP_MS) return false;
+  if (M.pickup && !lastPublishedPickup) return true;
+  if (M.dropdown && !lastPublishedDropDown) return true;
+  if (M.queueDetect != lastPublishedQueueDetect) return true;
+  if (M.browsing != lastPublishedBrowsing) return true;
+  if (M.awsOk != lastPublishedAwsOk) return true;
+  return false;
+}
+
+void markPublishedState(uint32_t nowMs) {
+  lastEventUploadMs = nowMs;
+  lastPublishedPickup = M.pickup;
+  lastPublishedDropDown = M.dropdown;
+  lastPublishedQueueDetect = M.queueDetect;
+  lastPublishedBrowsing = M.browsing;
+  lastPublishedAwsOk = M.awsOk;
+}
+
 void streamDirect(float signedSpeed_mps) {
   if (!directStreamReady()) return;
   char payload[1200];
@@ -1216,18 +1242,9 @@ void loop() {
 
   static long lastEnc = 0;
   long enc;
-  uint32_t pollHits;
+  noInterrupts();
   enc = encoderCount;
-  pollHits = encoderPollHits;
-
-  uint8_t rawA = (uint8_t)digitalRead(PIN_ENC_A);
-  uint8_t rawB = (uint8_t)digitalRead(PIN_ENC_B);
-
-  Serial.print("[ENC] A="); Serial.print(rawA);
-  Serial.print(" B=");       Serial.print(rawB);
-  Serial.print(" count=");   Serial.print(enc);
-  Serial.print(" pollHits="); Serial.print(pollHits);
-  Serial.print(" isrHits="); Serial.println(encIsrHits);
+  interrupts();
 
   long dEnc = enc - lastEnc;
   lastEnc = enc;
@@ -1287,6 +1304,12 @@ void loop() {
 
   updateSystemState();
 
+  if (shouldPublishEventNow(now)) {
+    publishTelemetry(signedSpeed_mps);
+    markPublishedState(now);
+    lastCloudUploadMs = now;
+  }
+
   if (now - lastSerialMs >= SERIAL_PERIOD_MS) {
     lastSerialMs = now;
     printSerialSummary(signedSpeed_mps);
@@ -1305,6 +1328,7 @@ void loop() {
   if (now - lastCloudUploadMs >= CLOUD_UPLOAD_MS) {
     lastCloudUploadMs = now;
     publishTelemetry(signedSpeed_mps);
+    markPublishedState(now);
   }
 
   M.pickup = false;

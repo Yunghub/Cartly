@@ -1,9 +1,20 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useMemo } from 'react'
 import {
   LineChart, Line, AreaChart, Area, BarChart, Bar, Cell,
   XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine, Legend,
 } from 'recharts'
 import './App.css'
+
+const API_BASE = (import.meta.env.VITE_API_BASE || 'https://api.cartly.yungcz.com').replace(/\/$/, '')
+const WS_BASE = (import.meta.env.VITE_WS_BASE || API_BASE.replace(/^http/, 'ws')).replace(/\/$/, '')
+
+function apiUrl(path) {
+  return `${API_BASE}${path}`
+}
+
+function wsUrl(path) {
+  return `${WS_BASE}${path}`
+}
 
 const ZONE_COLORS = {
   ZONE_A: '#ef4444',
@@ -43,6 +54,24 @@ const ANCHORS = [
 ]
 const RSSI_REFERENCE_DBM = -56
 const RSSI_PATH_LOSS = 2.2
+
+// ─── Store Map ────────────────────────────────────────────────────────────────
+const SM = 480
+const SM_W = 6
+const SM_H = 6
+const HEAT_RES = 80
+
+const SHELF_ROWS = [
+  { id: 's1', label: 'Bakery & Cereal',  fill: '#0f172a', x1: 0.4, y1: 1.30, x2: 5.6, y2: 1.72 },
+  { id: 's2', label: 'Dairy & Chilled',  fill: '#0b1a0d', x1: 0.4, y1: 2.45, x2: 5.6, y2: 2.87 },
+  { id: 's3', label: 'Fresh Produce',    fill: '#1a120a', x1: 0.4, y1: 3.58, x2: 5.6, y2: 4.00 },
+]
+
+const CHECKOUT_BAYS = [
+  { id: 'co1', label: 'Self-Checkout',   x1: 0.30, y1: 4.82, x2: 1.65, y2: 5.55 },
+  { id: 'co2', label: 'Quick Checkout',  x1: 2.15, y1: 4.82, x2: 3.50, y2: 5.55 },
+  { id: 'co3', label: 'Manned Checkout', x1: 4.00, y1: 4.82, x2: 5.65, y2: 5.55 },
+]
 
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value))
@@ -103,6 +132,41 @@ function estimatePointFromRssi(sample) {
   }
 }
 
+function heatColor(t) {
+  if (t < 0.25) return [0, Math.round(t * 4 * 255), 255]
+  if (t < 0.5)  return [0, 255, Math.round((1 - (t - 0.25) * 4) * 255)]
+  if (t < 0.75) return [Math.round((t - 0.5) * 4 * 255), 255, 0]
+  return [255, Math.round((1 - (t - 0.75) * 4) * 255), 0]
+}
+
+function buildHeatGrid(positions) {
+  const heat = new Float32Array(HEAT_RES * HEAT_RES)
+  const sigma = 3.5, sigma2 = 2 * sigma * sigma, r = Math.ceil(sigma * 3)
+  for (const { x, y } of positions) {
+    const cx = (x / SM_W) * (HEAT_RES - 1)
+    const cy = (y / SM_H) * (HEAT_RES - 1)
+    for (let dy = -r; dy <= r; dy++) {
+      for (let dx = -r; dx <= r; dx++) {
+        const nx = Math.round(cx + dx), ny = Math.round(cy + dy)
+        if (nx >= 0 && nx < HEAT_RES && ny >= 0 && ny < HEAT_RES)
+          heat[ny * HEAT_RES + nx] += Math.exp(-(dx * dx + dy * dy) / sigma2)
+      }
+    }
+  }
+  let maxVal = 0
+  for (let i = 0; i < heat.length; i++) if (heat[i] > maxVal) maxVal = heat[i]
+  return { heat, maxVal }
+}
+
+function nearestCheckout(x) {
+  let best = 0, bestDist = Infinity
+  CHECKOUT_BAYS.forEach((co, i) => {
+    const d = Math.abs(x - (co.x1 + co.x2) / 2)
+    if (d < bestDist) { bestDist = d; best = i }
+  })
+  return best
+}
+
 function fmtTime(iso) {
   if (!iso) return '-'
   return new Date(iso).toLocaleTimeString()
@@ -124,6 +188,126 @@ function StatCard({ label, value, unit, mono = true, color, sub }) {
       </div>
       {sub && <div className="stat-sub">{sub}</div>}
     </div>
+  )
+}
+
+function ExternalContextPanel({ context, nowTs }) {
+  const zone = context?.location?.timezone || 'Europe/London'
+  const timeFmt = new Intl.DateTimeFormat('en-GB', {
+    timeZone: zone,
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  })
+  const dateFmt = new Intl.DateTimeFormat('en-GB', {
+    timeZone: zone,
+    weekday: 'long',
+    day: '2-digit',
+    month: 'short',
+    year: 'numeric',
+  })
+
+  const weather = context?.weather
+  const sun = context?.sun
+  const currentTime = timeFmt.format(nowTs)
+  const currentDate = dateFmt.format(nowTs)
+  const partOfDay = context?.time?.part_of_day?.replace('_', ' ') || '-'
+  const shoppingPeriod = context?.time?.shopping_period || '-'
+
+  return (
+    <section className="panel external-panel">
+      <div className="external-header">
+        <div>
+          <div className="section-eyebrow">External Context</div>
+          <div className="section-heading">Store Conditions</div>
+        </div>
+        <div className="external-source-stack">
+          <span className="external-source">Time: server context</span>
+          <span className="external-source">Weather: Open-Meteo</span>
+        </div>
+      </div>
+
+      <div className="external-grid">
+        <div className="external-time-card">
+          <div className="external-clock">{currentTime}</div>
+          <div className="external-date">{currentDate}</div>
+          <div className="external-tags">
+            <span className="external-tag">{partOfDay}</span>
+            <span className="external-tag external-tag-accent">{shoppingPeriod}</span>
+            {context?.time?.is_weekend != null && (
+              <span className="external-tag">{context.time.is_weekend ? 'weekend' : 'weekday'}</span>
+            )}
+          </div>
+        </div>
+
+        <div className="external-weather-card">
+          <div className="external-weather-main">
+            <div>
+              <div className="panel-label">Weather</div>
+              <div className="external-weather-label">{weather?.weather_label || 'Unavailable'}</div>
+            </div>
+            <div className="external-weather-temp">
+              {weather?.temperature_c != null ? `${weather.temperature_c.toFixed(1)}°C` : '-'}
+            </div>
+          </div>
+          <div className="external-metrics">
+            <div className="external-metric">
+              <span className="external-metric-key">Feels like</span>
+              <span className="external-metric-val">
+                {weather?.apparent_temperature_c != null ? `${weather.apparent_temperature_c.toFixed(1)}°C` : '-'}
+              </span>
+            </div>
+            <div className="external-metric">
+              <span className="external-metric-key">Wind</span>
+              <span className="external-metric-val">
+                {weather?.wind_kph != null ? `${weather.wind_kph.toFixed(1)} km/h` : '-'}
+              </span>
+            </div>
+            <div className="external-metric">
+              <span className="external-metric-key">Rain</span>
+              <span className="external-metric-val">
+                {weather?.rain_mm != null ? `${weather.rain_mm.toFixed(1)} mm` : '-'}
+              </span>
+            </div>
+            <div className="external-metric">
+              <span className="external-metric-key">Cloud</span>
+              <span className="external-metric-val">
+                {weather?.cloud_cover_pct != null ? `${weather.cloud_cover_pct}%` : '-'}
+              </span>
+            </div>
+          </div>
+        </div>
+
+        <div className="external-sun-card">
+          <div className="panel-label">Daylight</div>
+          <div className="external-sun-grid">
+            <div className="external-metric">
+              <span className="external-metric-key">Sunrise</span>
+              <span className="external-metric-val">{fmtTime(sun?.sunrise)}</span>
+            </div>
+            <div className="external-metric">
+              <span className="external-metric-key">Sunset</span>
+              <span className="external-metric-val">{fmtTime(sun?.sunset)}</span>
+            </div>
+            <div className="external-metric">
+              <span className="external-metric-key">Daylight</span>
+              <span className="external-metric-val">
+                {sun?.daylight_hours != null ? `${sun.daylight_hours.toFixed(1)} h` : '-'}
+              </span>
+            </div>
+            <div className="external-metric">
+              <span className="external-metric-key">Mode</span>
+              <span className="external-metric-val">{weather?.is_day ? 'Day' : 'Night'}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {context?.warning && (
+        <div className="external-warning">{context.warning}</div>
+      )}
+    </section>
   )
 }
 
@@ -248,6 +432,246 @@ function PositionPlot({ history, currentEstimate }) {
   )
 }
 
+// ─── Store Heatmap (size-parameterised) ──────────────────────────────────────
+
+function StoreHeatmap({ positions, currentEstimate, size = 480 }) {
+  const canvasRef = useRef(null)
+  const pad = Math.round(size * (18 / 480))
+  const toX = wx => pad + (wx / SM_W) * (size - 2 * pad)
+  const toY = wy => pad + (wy / SM_H) * (size - 2 * pad)
+  const full = size >= 300
+  const legendId = `heatLegend-${size}`
+
+  useEffect(() => {
+    const canvas = canvasRef.current
+    if (!canvas) return
+    const ctx = canvas.getContext('2d')
+    ctx.clearRect(0, 0, size, size)
+    if (positions.length < 2) return
+    const { heat, maxVal } = buildHeatGrid(positions)
+    if (!maxVal) return
+    const cellW = (size - 2 * pad) / HEAT_RES
+    const cellH = (size - 2 * pad) / HEAT_RES
+    for (let gy = 0; gy < HEAT_RES; gy++) {
+      for (let gx = 0; gx < HEAT_RES; gx++) {
+        const t = heat[gy * HEAT_RES + gx] / maxVal
+        if (t < 0.03) continue
+        const [r, g, b] = heatColor(t)
+        ctx.fillStyle = `rgba(${r},${g},${b},${Math.min(0.82, t * 0.9)})`
+        ctx.fillRect(pad + gx * cellW, pad + gy * cellH, Math.ceil(cellW) + 1, Math.ceil(cellH) + 1)
+      }
+    }
+  }, [positions, size, pad])
+
+  const cur = currentEstimate
+  const activeCoIdx = cur && cur.y > 4.5 ? nearestCheckout(cur.x) : -1
+
+  return (
+    <div className="sm-wrap" style={{ width: size, height: size }}>
+      <svg width={size} height={size} className="sm-layer">
+        <rect width={size} height={size} fill="#090909" rx="10" />
+        <rect x={pad} y={pad} width={size - 2 * pad} height={size - 2 * pad} fill="#111" />
+        {[1, 2, 3, 4, 5].map(i => (
+          <g key={i}>
+            <line x1={toX(i)} y1={pad} x2={toX(i)} y2={size - pad} stroke="#161616" strokeWidth="1" />
+            <line x1={pad} y1={toY(i)} x2={size - pad} y2={toY(i)} stroke="#161616" strokeWidth="1" />
+          </g>
+        ))}
+        <rect x={toX(2.0)} y={pad} width={toX(4.0) - toX(2.0)} height={toY(0.2) - pad} fill="#22c55e14" />
+        {full && <text x={(toX(2.0) + toX(4.0)) / 2} y={pad + 10} textAnchor="middle" fill="#22c55e60" fontSize="8" fontFamily="Inter" fontWeight="600" letterSpacing="1">ENTRANCE</text>}
+      </svg>
+
+      <canvas ref={canvasRef} width={size} height={size} className="sm-layer sm-canvas" />
+
+      <svg width={size} height={size} className="sm-layer">
+        {SHELF_ROWS.map(s => {
+          const x = toX(s.x1), y = toY(s.y1), w = toX(s.x2) - toX(s.x1), h = toY(s.y2) - toY(s.y1)
+          return (
+            <g key={s.id}>
+              <rect x={x} y={y} width={w} height={h} fill={s.fill} rx="3" />
+              <rect x={x} y={y} width={w} height={h} fill="none" stroke="#1e293b" strokeWidth="1.5" rx="3" />
+              {full && [0.3, 0.65].map(f => (
+                <line key={f} x1={x + 4} y1={y + h * f} x2={x + w - 4} y2={y + h * f} stroke="#ffffff06" strokeWidth="0.5" />
+              ))}
+              {full && <text x={x + w / 2} y={y + h / 2 + 4} textAnchor="middle" fill="#94a3b8" fontSize="10" fontFamily="Inter" fontWeight="600">{s.label}</text>}
+            </g>
+          )
+        })}
+
+        {full && <text x={pad} y={toY(4.68)} fill="#3d3530" fontSize="8" fontFamily="Inter" fontWeight="600" letterSpacing="0.5">CHECKOUTS</text>}
+
+        {CHECKOUT_BAYS.map((co, i) => {
+          const x = toX(co.x1), y = toY(co.y1), w = toX(co.x2) - toX(co.x1), h = toY(co.y2) - toY(co.y1)
+          const active = i === activeCoIdx
+          return (
+            <g key={co.id}>
+              <rect x={x} y={y} width={w} height={h} fill={active ? '#a855f712' : '#110e0c'} rx="3" />
+              <rect x={x} y={y} width={w} height={h} fill="none" stroke={active ? '#a855f780' : '#221e1c'} strokeWidth={active ? 1.5 : 1} rx="3" />
+              <rect x={x + 3} y={y + 3} width={w - 6} height={5} fill={active ? '#a855f740' : '#1c1c1c'} rx="1" />
+              {full && <text x={x + w / 2} y={y + h / 2 + 4} textAnchor="middle" fill={active ? '#c4b5fd' : '#3d3530'} fontSize="9" fontFamily="Inter" fontWeight="600">{co.label}</text>}
+            </g>
+          )
+        })}
+
+        {ANCHORS.map(a => (
+          <g key={a.label}>
+            <circle cx={toX(a.x)} cy={toY(a.y)} r={full ? 9 : 4} fill={`${a.color}12`} stroke={`${a.color}40`} strokeWidth="1" />
+            <circle cx={toX(a.x)} cy={toY(a.y)} r={full ? 3 : 2} fill={a.color} />
+            {full && <text x={toX(a.x)} y={toY(a.y) - 13} textAnchor="middle" fill={a.color} fontSize="9" fontFamily="Inter" fontWeight="700">{a.label}</text>}
+          </g>
+        ))}
+
+        {cur && (
+          <>
+            <circle cx={toX(cur.x)} cy={toY(cur.y)} r={full ? 7 : 4} fill="#2563eb" opacity="0.9" />
+            <circle cx={toX(cur.x)} cy={toY(cur.y)} r={full ? 13 : 7} fill="none" stroke="#2563eb" strokeWidth="1" opacity="0.35" />
+          </>
+        )}
+
+        {full && (
+          <>
+            <line x1={pad} y1={size - 7} x2={toX(1)} y2={size - 7} stroke="#2d3748" strokeWidth="1.5" />
+            <line x1={pad} y1={size - 10} x2={pad} y2={size - 4} stroke="#2d3748" strokeWidth="1.5" />
+            <line x1={toX(1)} y1={size - 10} x2={toX(1)} y2={size - 4} stroke="#2d3748" strokeWidth="1.5" />
+            <text x={(pad + toX(1)) / 2} y={size - 1} textAnchor="middle" fill="#2d3748" fontSize="8" fontFamily="Inter">1 m</text>
+            <defs>
+              <linearGradient id={legendId} x1="0" y1="0" x2="1" y2="0">
+                <stop offset="0%"   stopColor="#0000ff" />
+                <stop offset="33%"  stopColor="#00ffff" />
+                <stop offset="66%"  stopColor="#ffff00" />
+                <stop offset="100%" stopColor="#ff0000" />
+              </linearGradient>
+            </defs>
+            <rect x={size - 82} y={size - 14} width={62} height={7} rx="2" fill={`url(#${legendId})`} opacity="0.6" />
+            <text x={size - 82} y={size - 2} fill="#2d3748" fontSize="7" fontFamily="Inter">low</text>
+            <text x={size - 20} y={size - 2} fill="#2d3748" fontSize="7" fontFamily="Inter" textAnchor="end">high</text>
+          </>
+        )}
+      </svg>
+    </div>
+  )
+}
+
+// ─── Queue Status ─────────────────────────────────────────────────────────────
+
+function QueueStatus({ live, positions, currentEstimate }) {
+  const activeIdx = currentEstimate ? nearestCheckout(currentEstimate.x) : -1
+  const dwellSec = live?.dwell_time_ms != null ? live.dwell_time_ms / 1000 : null
+
+  const bayHeat = useMemo(() => {
+    const counts = CHECKOUT_BAYS.map(() => 0)
+    for (const pt of positions.slice(-300)) {
+      if (!pt || pt.y < 4.5) continue
+      counts[nearestCheckout(pt.x)]++
+    }
+    return counts
+  }, [positions])
+  const maxBayHeat = Math.max(...bayHeat, 1)
+
+  return (
+    <div className="q-view">
+      <div className="q-bays">
+        {CHECKOUT_BAYS.map((co, i) => {
+          const active = i === activeIdx
+          const heatPct = bayHeat[i] / maxBayHeat
+          return (
+            <div key={co.id} className={`q-bay${active ? ' q-bay-on' : ''}`}>
+              <div className="q-bay-title">{co.label}</div>
+              <div className="q-bay-body">
+                <div className="q-counter">
+                  <div className="q-counter-top" style={{ background: active ? '#a855f7' : '#222' }} />
+                  <div className="q-counter-base" />
+                </div>
+                <div className="q-dots">
+                  {Array.from({ length: 4 }, (_, j) => (
+                    <div
+                      key={j}
+                      className="q-dot"
+                      style={{
+                        background: active && j === 0 ? '#a855f7' : '#1a1a1a',
+                        border: `1px solid ${active && j === 0 ? '#a855f7' : '#252525'}`,
+                        opacity: active ? (j === 0 ? 1 : 0.18) : 0.07,
+                      }}
+                    />
+                  ))}
+                </div>
+              </div>
+              <div className="q-bay-foot">
+                {active
+                  ? <span className="q-active-tag">Trolley queuing{dwellSec != null ? ` · ${dwellSec.toFixed(0)}s` : ''}</span>
+                  : <span className="q-idle-tag">Clear</span>
+                }
+                <div className="q-heat-track">
+                  <div className="q-heat-fill" style={{ width: `${heatPct * 100}%`, background: active ? '#a855f7' : '#333' }} />
+                </div>
+              </div>
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
+// ─── Store Panel ──────────────────────────────────────────────────────────────
+
+function StorePanel({ live, heatPositions, clearHeat }) {
+  const [expanded, setExpanded] = useState(false)
+  const isQueuing = live?.queue_detect
+  const currentEstimate = estimatePointFromRssi(live)
+
+  useEffect(() => {
+    if (!expanded) return
+    const onKey = e => { if (e.key === 'Escape') setExpanded(false) }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [expanded])
+
+  const controls = (onClear, onClose) => (
+    <div className="store-panel-actions">
+      {isQueuing
+        ? <span className="q-live-badge"><span className="q-live-dot" />Queue Detected</span>
+        : <span className="sm-pts">{heatPositions.length} pts this session</span>
+      }
+      <button className="sm-action-btn" onClick={onClear}>Clear</button>
+      {onClose && <button className="sm-action-btn sm-close-btn" onClick={onClose}>&#x2715;</button>}
+    </div>
+  )
+
+  return (
+    <>
+      <div className="panel store-panel">
+        <div className="store-panel-hdr">
+          <div className="panel-label">{isQueuing ? 'Queue Status' : 'Store Heatmap'}</div>
+          {controls(clearHeat, null)}
+        </div>
+
+        {isQueuing
+          ? <QueueStatus live={live} positions={heatPositions} currentEstimate={currentEstimate} />
+          : (
+            <div className="sm-thumb-wrap" onClick={() => setExpanded(true)}>
+              <StoreHeatmap positions={heatPositions} currentEstimate={currentEstimate} size={200} />
+              <div className="sm-thumb-hint">Expand</div>
+            </div>
+          )
+        }
+      </div>
+
+      {expanded && (
+        <div className="sm-backdrop" onClick={() => setExpanded(false)}>
+          <div className="sm-modal" onClick={e => e.stopPropagation()}>
+            <div className="store-panel-hdr">
+              <div className="panel-label">Store Heatmap — Full Session</div>
+              {controls(clearHeat, () => setExpanded(false))}
+            </div>
+            <StoreHeatmap positions={heatPositions} currentEstimate={currentEstimate} size={500} />
+          </div>
+        </div>
+      )}
+    </>
+  )
+}
+
 const ChartTooltip = ({ active, payload }) => {
   if (!active || !payload?.length) return null
   return (
@@ -262,7 +686,7 @@ const ChartTooltip = ({ active, payload }) => {
 }
 
 async function postConfig(payload) {
-  await fetch('/api/config', {
+  await fetch(apiUrl('/api/config'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
@@ -291,7 +715,7 @@ function QuickActions() {
       label: 'Alert Customer',
       sub: 'Flash screen and alert',
       color: '#f59e0b',
-      payload: { actuatorEnabled: true, actuatorPulseMs: 2000, displayFlashMs: 3000 },
+      payload: { actuatorEnabled: true, actuatorPulseMs: 2000, displayFlashMs: 8000 },
     },
     {
       key: 'stop',
@@ -377,7 +801,7 @@ function ConfigPanel() {
     if (!Object.keys(payload).length) return
 
     try {
-      const res = await fetch('/api/config', {
+      const res = await fetch(apiUrl('/api/config'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
@@ -491,7 +915,7 @@ function HistorySection() {
 
   useEffect(() => {
     setLoadingData(true)
-    fetch(`/api/telemetry/history?limit=${limit}`)
+    fetch(apiUrl(`/api/telemetry/history?limit=${limit}`))
       .then(r => r.json())
       .then(rows => setData([...rows].reverse()))
       .catch(() => {})
@@ -499,7 +923,7 @@ function HistorySection() {
   }, [limit])
 
   useEffect(() => {
-    fetch('/api/telemetry/stats')
+    fetch(apiUrl('/api/telemetry/stats'))
       .then(r => r.json())
       .then(setStats)
       .catch(() => {})
@@ -555,10 +979,10 @@ function HistorySection() {
               </button>
             ))}
           </div>
-          <a href="/api/telemetry/export?format=csv" className="btn-download" download="telemetry.csv">
+          <a href={apiUrl('/api/telemetry/export?format=csv')} className="btn-download" download="telemetry.csv">
             Download CSV
           </a>
-          <a href="/api/telemetry/export?format=json" className="btn-download btn-download-sec" download="telemetry.json">
+          <a href={apiUrl('/api/telemetry/export?format=json')} className="btn-download btn-download-sec" download="telemetry.json">
             Download JSON
           </a>
         </div>
@@ -775,21 +1199,42 @@ export default function App() {
   const [live, setLive] = useState(null)
   const [connected, setConnected] = useState(false)
   const [history, setHistory] = useState([])
+  const [heatPositions, setHeatPositions] = useState([])
   const [updateRateMs, setUpdateRateMs] = useState(null)
+  const [externalContext, setExternalContext] = useState(null)
+  const [nowTs, setNowTs] = useState(Date.now())
   const wsRef = useRef(null)
   const lastMsgRef = useRef(null)
+  const heatSampleRef = useRef(0)
+  const clearHeat = () => setHeatPositions([])
 
   useEffect(() => {
-    fetch('/api/telemetry/history?limit=200')
+    fetch(apiUrl('/api/telemetry/history?limit=200'))
       .then(r => r.json())
       .then(data => setHistory([...data].reverse()))
       .catch(() => {})
   }, [])
 
   useEffect(() => {
-    const wsUrl = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`
+    const loadContext = () => {
+      fetch(apiUrl('/api/context/external'))
+        .then(r => r.json())
+        .then(data => setExternalContext(data))
+        .catch(() => {})
+    }
+    loadContext()
+    const refreshId = setInterval(loadContext, 5 * 60 * 1000)
+    return () => clearInterval(refreshId)
+  }, [])
+
+  useEffect(() => {
+    const tickId = setInterval(() => setNowTs(Date.now()), 1000)
+    return () => clearInterval(tickId)
+  }, [])
+
+  useEffect(() => {
     const connect = () => {
-      const ws = new WebSocket(wsUrl)
+      const ws = new WebSocket(wsUrl('/ws'))
       wsRef.current = ws
       ws.onopen = () => setConnected(true)
       ws.onclose = () => { setConnected(false); setTimeout(connect, 3000) }
@@ -799,6 +1244,11 @@ export default function App() {
           const data = JSON.parse(e.data)
           setLive(data)
           setHistory(h => [...h, data].slice(-300))
+          heatSampleRef.current++
+          if (heatSampleRef.current % 5 === 0) {
+            const hpt = estimatePointFromRssi(data)
+            if (hpt) setHeatPositions(prev => [...prev, { x: hpt.x, y: hpt.y }])
+          }
           const now = Date.now()
           if (lastMsgRef.current) setUpdateRateMs(now - lastMsgRef.current)
           lastMsgRef.current = now
@@ -814,6 +1264,19 @@ export default function App() {
   const d = live || {}
   const chartData = history.slice(-120)
   const currentEstimate = estimatePointFromRssi(d)
+  const zone = externalContext?.location?.timezone || 'Europe/London'
+  const navTime = new Intl.DateTimeFormat('en-GB', {
+    timeZone: zone,
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).format(nowTs)
+  const weatherLabel = externalContext?.weather?.weather_label || null
+  const weatherTemp = externalContext?.weather?.temperature_c
+  const weatherText = weatherLabel
+    ? `${weatherLabel}${weatherTemp != null ? ` ${weatherTemp.toFixed(1)}C` : ''}`
+    : null
+  const shoppingText = externalContext?.time?.shopping_period || null
 
   return (
     <div className="app">
@@ -826,6 +1289,22 @@ export default function App() {
           <span className="nav-product">SmartTrolley</span>
         </div>
         <div className="nav-right">
+          {weatherText && (
+            <div className="context-chip">
+              <span className="context-chip-label">Weather</span>
+              <span className="context-chip-value">{weatherText}</span>
+            </div>
+          )}
+          {shoppingText && (
+            <div className="context-chip">
+              <span className="context-chip-label">Flow</span>
+              <span className="context-chip-value">{shoppingText}</span>
+            </div>
+          )}
+          <div className="context-chip context-chip-time">
+            <span className="context-chip-label">Local</span>
+            <span className="context-chip-value">{navTime}</span>
+          </div>
           {d.system_state && (
             <div
               className="state-chip"
@@ -966,44 +1445,48 @@ export default function App() {
           </div>
         </div>
 
-        <div className="panel chart-panel">
-          <div className="chart-header">
-            <div>
-              <div className="panel-label">Speed — Live</div>
-              <div className="chart-sub">Last {chartData.length} readings</div>
+        <div className="speed-map-row">
+          <StorePanel live={live} heatPositions={heatPositions} clearHeat={clearHeat} />
+
+          <div className="panel chart-panel">
+            <div className="chart-header">
+              <div>
+                <div className="panel-label">Speed — Live</div>
+                <div className="chart-sub">Last {chartData.length} readings</div>
+              </div>
+              <div className="chart-legend">
+                <span><span className="leg-dot" style={{ background: '#2563eb' }} />Speed</span>
+                <span><span className="leg-dot" style={{ background: '#7c3aed' }} />Signed</span>
+              </div>
             </div>
-            <div className="chart-legend">
-              <span><span className="leg-dot" style={{ background: '#2563eb' }} />Speed</span>
-              <span><span className="leg-dot" style={{ background: '#7c3aed' }} />Signed</span>
-            </div>
+            <ResponsiveContainer width="100%" height={180}>
+              <LineChart data={chartData} margin={{ top: 4, right: 4, bottom: 0, left: -20 }}>
+                <CartesianGrid strokeDasharray="2 6" stroke="#1a1a1a" />
+                <XAxis dataKey="id" hide />
+                <YAxis stroke="#333" fontSize={10} tickFormatter={v => v.toFixed(1)} />
+                <Tooltip content={<ChartTooltip />} />
+                <ReferenceLine y={0} stroke="#333" strokeWidth={1} />
+                <Line
+                  type="monotone"
+                  dataKey="speed_mps"
+                  stroke="#2563eb"
+                  dot={false}
+                  strokeWidth={1.5}
+                  name="Speed"
+                  isAnimationActive={false}
+                />
+                <Line
+                  type="monotone"
+                  dataKey="signed_speed_mps"
+                  stroke="#7c3aed"
+                  dot={false}
+                  strokeWidth={1.5}
+                  name="Signed"
+                  isAnimationActive={false}
+                />
+              </LineChart>
+            </ResponsiveContainer>
           </div>
-          <ResponsiveContainer width="100%" height={180}>
-            <LineChart data={chartData} margin={{ top: 4, right: 4, bottom: 0, left: -20 }}>
-              <CartesianGrid strokeDasharray="2 6" stroke="#1a1a1a" />
-              <XAxis dataKey="id" hide />
-              <YAxis stroke="#333" fontSize={10} tickFormatter={v => v.toFixed(1)} />
-              <Tooltip content={<ChartTooltip />} />
-              <ReferenceLine y={0} stroke="#333" strokeWidth={1} />
-              <Line
-                type="monotone"
-                dataKey="speed_mps"
-                stroke="#2563eb"
-                dot={false}
-                strokeWidth={1.5}
-                name="Speed"
-                isAnimationActive={false}
-              />
-              <Line
-                type="monotone"
-                dataKey="signed_speed_mps"
-                stroke="#7c3aed"
-                dot={false}
-                strokeWidth={1.5}
-                name="Signed"
-                isAnimationActive={false}
-              />
-            </LineChart>
-          </ResponsiveContainer>
         </div>
 
         <HistorySection />
